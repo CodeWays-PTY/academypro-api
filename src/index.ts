@@ -3313,27 +3313,13 @@ app.post('/api/test-logs/batch', async (c) => {
 
         // Auto check-in athlete as 'Present' for this test event / session
         try {
-          await db.prepare(`
-            CREATE TABLE IF NOT EXISTS attendance (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              player_id TEXT NOT NULL,
-              session_type TEXT NOT NULL,
-              date TEXT NOT NULL,
-              status TEXT NOT NULL,
-              event_id TEXT,
-              created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-          `).run().catch(() => {});
-
           const attEvtId = eventId ? String(eventId) : null;
           const sessType = sessionName || 'Fitness Test';
 
-          const existingAtt = await db.prepare('SELECT id FROM attendance WHERE player_id = ? AND date = ? AND (event_id = ? OR session_type = ?)').bind(pId, testDate, attEvtId || '', sessType).first();
-          if (existingAtt) {
-            await db.prepare("UPDATE attendance SET status = 'Present', event_id = ? WHERE id = ?").bind(attEvtId, existingAtt.id).run();
-          } else {
-            await db.prepare("INSERT INTO attendance (player_id, session_type, date, status, event_id) VALUES (?, ?, ?, 'Present', ?)").bind(pId, sessType, testDate, attEvtId).run();
-          }
+          // Use INSERT OR REPLACE with the composite PK (player_id, session_type, date)
+          await db.prepare(
+            "INSERT OR REPLACE INTO attendance (player_id, session_type, date, status, event_id) VALUES (?, ?, ?, 'Present', ?)"
+          ).bind(pId, sessType, testDate, attEvtId).run();
         } catch (attErr) {
           console.warn(`Failed auto check-in attendance for player ${pId}:`, attErr);
         }
