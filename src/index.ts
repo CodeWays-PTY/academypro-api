@@ -1408,9 +1408,9 @@ app.get('/api/rosters/:age_group', async (c) => {
     const pHolders = stringPlayerIds.map(() => '?').join(',');
 
     const { results: logResults } = await db.prepare(`
-      SELECT ptl.player_id, ptl.metric_id, ptl.score, ptl.test_date, ptl.session_name, tm.name as metric_name, tm.unit
+      SELECT ptl.player_id, ptl.metric_id, ptl.score, ptl.test_date, ptl.session_name, tmd.name as metric_name, tmd.unit
       FROM player_test_logs ptl
-      LEFT JOIN test_metrics tm ON CAST(tm.id AS TEXT) = CAST(ptl.metric_id AS TEXT) OR tm.name = ptl.metric_id
+      LEFT JOIN test_metric_definitions tmd ON CAST(tmd.id AS TEXT) = CAST(ptl.metric_id AS TEXT) OR tmd.name = ptl.metric_id
       WHERE CAST(ptl.player_id AS TEXT) IN (${pHolders})
       ORDER BY ptl.test_date DESC, ptl.created_at DESC
     `).bind(...stringPlayerIds).all();
@@ -1438,7 +1438,7 @@ app.get('/api/rosters/:age_group', async (c) => {
       p.testLogs = playerLogsMap[pIdStr] || [];
       p.fitnessBaselines = playerLogsMap[pIdStr] || [];
     }
-  } catch (_) {}
+  } catch (e) { console.error('[Roster] Failed to attach test logs:', e); }
 
   return c.json({
     success: true,
