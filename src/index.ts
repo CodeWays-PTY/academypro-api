@@ -955,10 +955,11 @@ app.get('/api/test-results', async (c) => {
       eventId: r.event_id || '',
       athleteId: r.player_id || '',
       athleteName: r.athlete_name || '',
-      testName: r.test_name || r.session_name || '',
+      testName: r.test_name || r.metric_id || r.session_name || '',
+      metricId: r.metric_id || '',
       category: r.category || '',
       unit: r.unit || '',
-      scoreValue: r.score_value || 0,
+      scoreValue: r.score ?? r.score_value ?? 0,
       testDate: r.test_date || r.created_at
     }));
     return c.json({ success: true, data: formatted });
