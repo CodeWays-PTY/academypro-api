@@ -2488,8 +2488,8 @@ const handleGetCheckins = async (c: any) => {
       const targetDate = ev?.date || new Date().toISOString().split('T')[0];
 
       const { results: evtResults } = await db.prepare(`
-        SELECT player_id FROM attendance WHERE (CAST(event_id AS TEXT) = ? OR event_id = ?) AND status = 'Present'
-      `).bind(eventId.toString(), eventId.toString()).all();
+        SELECT player_id FROM attendance WHERE (CAST(event_id AS TEXT) = ? OR event_id = ?) AND date = ? AND status = 'Present'
+      `).bind(eventId.toString(), eventId.toString(), targetDate).all();
 
       const checkedInPlayerIds = (evtResults || []).map((r: any) => r.player_id);
       const checkinArray = (evtResults || []).map((r: any) => ({
@@ -3327,7 +3327,7 @@ app.post('/api/test-logs/batch', async (c) => {
           const attEvtId = eventId ? String(eventId) : null;
           const sessType = sessionName || 'Fitness Test';
 
-          const existingAtt = await db.prepare('SELECT id FROM attendance WHERE player_id = ? AND (event_id = ? OR (session_type = ? AND date = ?))').bind(pId, attEvtId || '', sessType, testDate).first();
+          const existingAtt = await db.prepare('SELECT id FROM attendance WHERE player_id = ? AND date = ? AND (event_id = ? OR session_type = ?)').bind(pId, testDate, attEvtId || '', sessType).first();
           if (existingAtt) {
             await db.prepare("UPDATE attendance SET status = 'Present', event_id = ? WHERE id = ?").bind(attEvtId, existingAtt.id).run();
           } else {
