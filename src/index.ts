@@ -1412,7 +1412,7 @@ app.get('/api/rosters/:age_group', async (c) => {
       FROM player_test_logs ptl
       LEFT JOIN test_metric_definitions tmd ON CAST(tmd.id AS TEXT) = CAST(ptl.metric_id AS TEXT) OR tmd.name = ptl.metric_id
       WHERE CAST(ptl.player_id AS TEXT) IN (${pHolders})
-      ORDER BY ptl.test_date DESC, ptl.created_at DESC
+      ORDER BY ptl.created_at DESC, ptl.test_date DESC
     `).bind(...stringPlayerIds).all();
 
     const playerLogsMap: Record<string, any[]> = {};
