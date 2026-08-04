@@ -3187,6 +3187,42 @@ app.post('/api/dashboard/test-logs', async (c) => {
   url.pathname = '/api/test-logs/batch';
   return app.fetch(new Request(url.toString(), c.req.raw), c.env, c.executionCtx);
 });
+// Route: Get saved test scores scoped to a specific event + date
+app.get('/api/test-logs/by-event', async (c) => {
+  const db = getDB(c);
+  if (!db) return c.json({ success: false, message: 'Database connection unavailable' }, 500);
+
+  const eventId = c.req.query('eventId') || c.req.query('event_id');
+  const testDate = c.req.query('testDate') || c.req.query('test_date');
+
+  if (!eventId) return c.json({ success: false, message: 'eventId query parameter is required' }, 400);
+
+  try {
+    let query = 'SELECT player_id, metric_id, score FROM player_test_logs WHERE event_id = ?';
+    const bindings: any[] = [eventId];
+    if (testDate) {
+      query += ' AND test_date = ?';
+      bindings.push(testDate);
+    }
+
+    const { results } = await db.prepare(query).bind(...bindings).all();
+
+    // Build nested map: { playerId: { metricId: score } }
+    const scoreMap: Record<string, Record<string, number>> = {};
+    for (const row of (results || [])) {
+      const pId = String(row.player_id);
+      const mId = String(row.metric_id);
+      if (!scoreMap[pId]) scoreMap[pId] = {};
+      scoreMap[pId][mId] = row.score as number;
+    }
+
+    return c.json({ success: true, data: scoreMap });
+  } catch (err: any) {
+    console.error('[Observer Error] Failed to fetch event test logs:', err);
+    return c.json({ success: false, message: 'Failed to fetch event scores', error: err.message }, 500);
+  }
+});
+
 app.post('/api/test-logs', async (c) => {
   const url = new URL(c.req.url);
   url.pathname = '/api/test-logs/batch';
@@ -3251,7 +3287,7 @@ app.post('/api/test-logs/batch', async (c) => {
 
       try {
         // Check if log already exists for player, metric and test_date
-        const existing = await db.prepare('SELECT id FROM player_test_logs WHERE player_id = ? AND metric_id = ? AND test_date = ?').bind(pId, targetMetricId, testDate).first();
+        const existing = await db.prepare('SELECT id FROM player_test_logs WHERE player_id = ? AND metric_id = ? AND event_id = ? AND test_date = ?').bind(pId, targetMetricId, eventId || '', testDate).first();
         const targetId = existing?.id || item.id || fallbackId;
 
         await db.prepare(`
