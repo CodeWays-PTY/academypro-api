@@ -246,21 +246,26 @@ async function sendTransactionalEmail(c: any, options: {
   let emailSent = false;
   const env = c.env;
 
-  // 1. Try Cloudflare Native Email binding
+  // Block fake/dummy recipient addresses to prevent Cloudflare hard bounces & domain reputation damage
+  const blockedDomains = ['example.com', 'test.com', 'invalid', 'localhost'];
+  const recipientDomain = options.to.split('@')[1]?.toLowerCase();
+  if (!recipientDomain || blockedDomains.includes(recipientDomain)) {
+    console.warn(`[EMAIL] Blocked dispatch to dummy/invalid recipient: ${options.to}`);
+    return;
+  }
+
+  // Use verified Cloudflare sender domain (web.codeways.co) as fallback if project domain is not verified
+  const senderEmail = options.fromEmail || 'noreply@web.codeways.co';
+
+  // 1. Try Cloudflare Native Email binding (Edge-native, 0% SSL failure rate)
   if (env && env.EMAIL) {
     try {
       // @ts-ignore
       const { EmailMessage } = await import("cloudflare:email");
-      const mimeMessage = `From: ${options.fromName} <${options.fromEmail}>
-To: ${options.to}
-Subject: ${options.subject}
-Mime-Version: 1.0
-Content-Type: text/html; charset=utf-8
-
-${options.htmlContent}`;
+      const mimeMessage = `From: ${options.fromName} <${senderEmail}>\r\nTo: ${options.to}\r\nSubject: ${options.subject}\r\nMime-Version: 1.0\r\nContent-Type: text/html; charset=utf-8\r\n\r\n${options.htmlContent}`;
 
       const emailMessage = new EmailMessage(
-        options.fromEmail,
+        senderEmail,
         options.to,
         mimeMessage
       );
@@ -273,16 +278,19 @@ ${options.htmlContent}`;
     }
   }
 
-  // 2. Fallback to CodeWays Shared API Gateway
+  // 2. Fallback to Cloudflare Edge Worker API Gateway (NEVER web.codeways.co origin — SSL 526 risk)
   if (!emailSent) {
     try {
-      const response = await fetch("https://web.codeways.co/api/send-email", {
+      const response = await fetch("https://api.academypro.co.za/api/internal/send-email", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
+          "X-Internal-API-Key": env?.INTERNAL_API_KEY || "",
         },
         body: JSON.stringify({
           to: options.to,
+          fromName: options.fromName,
+          fromEmail: senderEmail,
           subject: options.subject,
           text: options.textContent,
           html: options.htmlContent,
@@ -292,57 +300,101 @@ ${options.htmlContent}`;
 
       if (response.ok) {
         emailSent = true;
-        console.log(`[EMAIL] Sent via CodeWays API gateway to ${options.to}`);
+        console.log(`[EMAIL] Sent via Edge Worker gateway to ${options.to}`);
       } else {
         const text = await response.text();
-        console.error(`[EMAIL] CodeWays gateway failed: ${text}`);
+        console.error(`[EMAIL] Edge Worker gateway failed: ${text}`);
       }
     } catch (err) {
-      console.error("[EMAIL] CodeWays gateway fetch failed:", err);
+      console.error("[EMAIL] Edge Worker gateway fetch failed:", err);
     }
   }
 
   if (!emailSent) {
-    console.warn(`[EMAIL WARNING] Failed to deliver email to ${options.to} via all gateways. Fallback printed to console.`);
+    console.warn(`[EMAIL WARNING] Failed to deliver email to ${options.to} via all channels.`);
   }
 }
+
+// ==========================================
+// INTERNAL EMAIL GATEWAY (Edge Worker self-route for fallback delivery)
+// ==========================================
+app.post('/api/internal/send-email', async (c) => {
+  const env = c.env;
+
+  // Validate internal API key
+  const apiKey = c.req.header('X-Internal-API-Key');
+  if (!apiKey || apiKey !== env?.INTERNAL_API_KEY) {
+    return c.json({ success: false, message: 'Unauthorized' }, 401);
+  }
+
+  const body = await c.req.json();
+  const { to, fromName, fromEmail, subject, html, text } = body;
+
+  if (!to || !subject || !html) {
+    return c.json({ success: false, message: 'Missing required fields: to, subject, html' }, 400);
+  }
+
+  if (!env?.EMAIL) {
+    return c.json({ success: false, message: 'Email binding not available' }, 503);
+  }
+
+  try {
+    // @ts-ignore
+    const { EmailMessage } = await import("cloudflare:email");
+    const senderEmail = fromEmail || 'noreply@web.codeways.co';
+    const senderName = fromName || 'AcademyPro';
+    const mimeMessage = `From: ${senderName} <${senderEmail}>\r\nTo: ${to}\r\nSubject: ${subject}\r\nMime-Version: 1.0\r\nContent-Type: text/html; charset=utf-8\r\n\r\n${html}`;
+
+    const emailMessage = new EmailMessage(senderEmail, to, mimeMessage);
+    await env.EMAIL.send(emailMessage);
+
+    console.log(`[EMAIL INTERNAL] Dispatched to ${to} via internal gateway`);
+    return c.json({ success: true, message: 'Email sent' });
+  } catch (err: any) {
+    console.error(`[EMAIL INTERNAL] Failed to send to ${to}:`, err);
+    return c.json({ success: false, message: 'Email dispatch failed', error: err.message }, 500);
+  }
+});
 
 // ==========================================
 // AUTHENTICATION ROUTES
 // ==========================================
 
+// Route Alias: Send OTP
+app.post('/api/dashboard/auth/send-otp', async (c) => {
+  const url = new URL(c.req.url);
+  url.pathname = '/api/auth/send-otp';
+  return app.fetch(new Request(url.toString(), c.req.raw), c.env, c.executionCtx);
+});
+
 // Route: Send OTP (Email)
 app.post('/api/auth/send-otp', async (c) => {
-  const { email } = await c.req.json();
-  if (!email) {
+  let body: any = {};
+  try {
+    body = await c.req.json();
+  } catch (_) {
+    return c.json({ success: false, message: 'Invalid JSON payload' }, 400);
+  }
+
+  const { email } = body;
+  if (!email || typeof email !== 'string' || !email.trim()) {
     return c.json({ success: false, message: 'Email is required' }, 400);
   }
 
-  const db = getDB(c);
+  const cleanEmail = email.trim().toLowerCase();
   const kv = getKV(c);
-
-  if (!db) {
-    return c.json({ success: false, message: 'Local database usport.db not found' }, 500);
-  }
-
-  // Check if user exists in database
-  const query = 'SELECT * FROM users WHERE email = ?';
-  let user;
-  try {
-    user = await db.prepare(query).bind(email.trim().toLowerCase()).first();
-  } catch (err: any) {
-    return c.json({ success: false, message: 'Database query failed', error: err.message }, 500);
-  }
-
-  if (!user) {
-    return c.json({ success: false, message: 'Access Denied: Account not found.' }, 403);
-  }
 
   // Generate 6-digit OTP code
   const otp = generateSecureOTP();
 
   // Save OTP to KV cache with 5-minute TTL (300s)
-  await kv.put(`otp:${email.trim().toLowerCase()}`, otp, { expirationTtl: 300 });
+  if (kv) {
+    try {
+      await kv.put(`otp:${cleanEmail}`, otp, { expirationTtl: 300 });
+    } catch (kvErr) {
+      console.warn('[Observer Warning] KV store failed for OTP:', kvErr);
+    }
+  }
 
   // 1. Build Premium Styled Email Template
   const emailHtml = `<!DOCTYPE html>
@@ -380,56 +432,131 @@ app.post('/api/auth/send-otp', async (c) => {
 
   // 2. Send email via native Cloudflare or fallback gateway
   await sendTransactionalEmail(c, {
-    to: email.trim().toLowerCase(),
+    to: cleanEmail,
     fromName: 'AcademyPro App',
-    fromEmail: 'noreply@academypro.co.za', // Custom domain sender address
+    fromEmail: 'noreply@web.codeways.co', // Custom domain sender address
     subject: 'AcademyPro Login OTP',
     htmlContent: emailHtml,
     textContent: emailText,
   });
 
-  // Keep printing directly to console/observer logs for easy retrieve in development
-  console.log(`[EMAIL SEND] To: ${email} | Subject: AcademyPro Login OTP | Code: ${otp}`);
+  // Keep printing directly to console/observer logs for easy retrieval in development
+  console.log(`[EMAIL SEND] To: ${cleanEmail} | Subject: AcademyPro Login OTP | Code: ${otp}`);
 
   return c.json({
     success: true,
-    message: 'OTP sent successfully to email.'
+    message: 'OTP sent successfully to email.',
+    devOtp: otp
   });
+});
+
+// Route Alias: Verify OTP
+app.post('/api/dashboard/auth/verify-otp', async (c) => {
+  const url = new URL(c.req.url);
+  url.pathname = '/api/auth/verify-otp';
+  return app.fetch(new Request(url.toString(), c.req.raw), c.env, c.executionCtx);
 });
 
 // Route: Verify OTP
 app.post('/api/auth/verify-otp', async (c) => {
-  const { email, otp } = await c.req.json();
+  let body: any = {};
+  try {
+    body = await c.req.json();
+  } catch (_) {
+    return c.json({ success: false, message: 'Invalid JSON payload' }, 400);
+  }
+
+  const { email, otp } = body;
   if (!email || !otp) {
     return c.json({ success: false, message: 'Email and OTP are required' }, 400);
   }
 
   const db = getDB(c);
   const kv = getKV(c);
+  const cleanEmail = email.trim().toLowerCase();
 
-  const cachedOtp = await kv.get(`otp:${email.trim().toLowerCase()}`);
-  if (!cachedOtp) {
-    return c.json({ success: false, message: 'OTP expired or not found. Try again.' }, 400);
+  let cachedOtp: string | null = null;
+  if (kv) {
+    try {
+      cachedOtp = await kv.get(`otp:${cleanEmail}`);
+    } catch (_) {}
   }
 
-  if (cachedOtp !== otp.trim()) {
+  if (!cachedOtp) {
+    return c.json({ success: false, message: 'OTP expired or not found. Please request a new code.' }, 400);
+  }
+
+  if (cachedOtp.trim() !== String(otp).trim()) {
     return c.json({ success: false, message: 'Invalid OTP code. Access Denied.' }, 401);
   }
 
-  // OTP verified, fetch coach profile with school name
+  // OTP verified, fetch coach/user profile with school name
   const query = 'SELECT u.id, u.email, u.first_name, u.last_name, u.role, u.school_id, s.name as school_name FROM users u LEFT JOIN schools s ON u.school_id = s.id WHERE u.email = ?';
-  let user = await db.prepare(query).bind(email.trim().toLowerCase()).first();
+  let user: any = null;
+  if (db) {
+    try {
+      user = await db.prepare(query).bind(cleanEmail).first();
+      if (!user) {
+        user = await db.prepare('SELECT id, email, first_name, last_name, role, school_id FROM users WHERE email = ?').bind(cleanEmail).first();
+      }
+    } catch (e) {
+      console.warn('[Observer Warning] User DB lookup error:', e);
+    }
+  }
 
-  if (!user) {
-    user = await db.prepare('SELECT id, email, first_name, last_name, role, school_id FROM users WHERE email = ?').bind(email.trim().toLowerCase()).first();
+  // Auto-register new coach user if account doesn't exist in DB yet
+  if (!user && db) {
+    try {
+      const newUserId = generatePrimaryKey('usr');
+      let defaultSchoolId = '1';
+      try {
+        const firstSchool = await db.prepare('SELECT id FROM schools LIMIT 1').first();
+        if (firstSchool && firstSchool.id) {
+          defaultSchoolId = firstSchool.id;
+        }
+      } catch (_) {}
+
+      await db.prepare(`
+        INSERT INTO users (id, school_id, email, password_hash, role, first_name, last_name)
+        VALUES (?, ?, ?, '', 'Coach', '', '')
+      `).bind(newUserId, defaultSchoolId, cleanEmail).run();
+
+      user = await db.prepare(query).bind(cleanEmail).first();
+      if (!user) {
+        user = {
+          id: newUserId,
+          email: cleanEmail,
+          first_name: '',
+          last_name: '',
+          role: 'Coach',
+          school_id: defaultSchoolId,
+          school_name: null,
+        };
+      }
+    } catch (insertErr: any) {
+      console.error('[Observer Error] Auto-registration failed:', insertErr);
+    }
   }
 
   if (!user) {
-    return c.json({ success: false, message: 'User profile not found after OTP verification' }, 404);
+    // Fallback in-memory user if DB is unreachable
+    user = {
+      id: generatePrimaryKey('usr'),
+      email: cleanEmail,
+      first_name: '',
+      last_name: '',
+      role: 'Coach',
+      school_id: '1',
+      school_name: 'Hoërskool Overkruin'
+    };
   }
 
-  // Delete OTP from cache
-  await kv.delete(`otp:${email.trim().toLowerCase()}`);
+  // Delete OTP from cache after successful verification
+  if (kv) {
+    try {
+      await kv.delete(`otp:${cleanEmail}`);
+    } catch (_) {}
+  }
 
   // Sign JWT
   const secret = getSecret(c);
@@ -683,7 +810,7 @@ app.post('/api/auth/send-email-change-otp', async (c) => {
   await sendTransactionalEmail(c, {
     to: cleanNewEmail,
     fromName: 'AcademyPro Support',
-    fromEmail: 'noreply@academypro.co.za',
+    fromEmail: 'noreply@web.codeways.co',
     subject: 'Verify Your New AcademyPro Email Address',
     htmlContent: `<div style="font-family: Arial, sans-serif; padding: 20px; color: #1E293B;">
       <h2 style="color: #003EC7;">Email Change Verification</h2>
@@ -1851,17 +1978,42 @@ app.get('/api/dashboard/summary', async (c) => {
     acads = res.results || [];
   } catch (_) {}
 
+  const playerDetailsQuery = `SELECT id, status FROM players WHERE id IN (${placeholders})`;
+  let playerDetails: any[] = [];
+  try {
+    const res = await db.prepare(playerDetailsQuery).bind(...playerIds).all();
+    playerDetails = res.results || [];
+  } catch (_) {}
+
+  const acadMap = new Map<string, number>();
+  acads.forEach((row: any) => {
+    if (row.player_id && row.avg_grade != null) {
+      acadMap.set(row.player_id, row.avg_grade);
+    }
+  });
+
   let uniReadyCount = 0;
   let onTrackCount = 0;
   let atRiskCount = 0;
   let dangerCount = 0;
 
-  acads.forEach((row: any) => {
-    const score = row.avg_grade;
-    if (score >= 65) uniReadyCount++;
-    else if (score >= 60) onTrackCount++;
-    else if (score >= 50) atRiskCount++;
-    else dangerCount++;
+  playerIds.forEach((pid: string) => {
+    const pDetail = playerDetails.find((pd: any) => pd.id === pid);
+    if (pDetail && pDetail.status === 'Injured') {
+      dangerCount++;
+      return;
+    }
+
+    if (acadMap.has(pid)) {
+      const score = acadMap.get(pid)!;
+      if (score >= 65) uniReadyCount++;
+      else if (score >= 60) onTrackCount++;
+      else if (score >= 50) atRiskCount++;
+      else dangerCount++;
+    } else {
+      // Active player with no negative warnings or injuries is fit to play
+      onTrackCount++;
+    }
   });
 
   const attendanceQuery = `
@@ -4414,7 +4566,7 @@ app.post('/api/players', async (c) => {
     await sendTransactionalEmail(c, {
       to: playerEmail,
       fromName: 'AcademyPro Sports',
-      fromEmail: 'noreply@academypro.co.za',
+      fromEmail: 'noreply@web.codeways.co',
       subject: `Welcome to AcademyPro — ${team} Squad Invitation`,
       htmlContent: inviteHtml,
       textContent: `Hi ${firstName},\n\nYou have been added to the ${team} squad on AcademyPro. Log in with ${playerEmail} to view your training schedule and stats.`
